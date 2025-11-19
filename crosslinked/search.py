@@ -1,4 +1,5 @@
 import logging
+import requests
 import threading
 from time import sleep
 from random import choice, uniform, randint
@@ -7,26 +8,10 @@ from unidecode import unidecode
 from urllib.parse import urlparse, quote_plus
 from crosslinked.logger import Log
 from datetime import datetime, timedelta
+from urllib3 import disable_warnings, exceptions
 
-# Try to import curl_cffi first (fixes JA4/JA3 TLS fingerprinting)
-try:
-    from curl_cffi import requests
-    from curl_cffi.requests import RequestsError
-    CURL_CFFI_AVAILABLE = True
-    Log.success("Using curl_cffi - TLS fingerprinting protection enabled")
-except ImportError:
-    import requests
-    from requests.exceptions import RequestException as RequestsError
-    from urllib3 import disable_warnings, exceptions
-    disable_warnings(exceptions.InsecureRequestWarning)
-    CURL_CFFI_AVAILABLE = False
-    Log.warn("curl_cffi not installed - TLS fingerprinting may cause blocks")
-    Log.warn("Install with: pip install curl_cffi")
-
-# Disable SSL warnings
-if not CURL_CFFI_AVAILABLE:
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-
+disable_warnings(exceptions.InsecureRequestWarning)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 csv = logging.getLogger('cLinked_csv')
 
 
@@ -322,6 +307,8 @@ def get_varied_headers(user_agent=None):
 
 def web_request(url, timeout=3, proxies=[], user_agent=None, **kwargs):
     try:
+        s = requests.Session()
+        
         # Get varied headers
         headers = get_varied_headers(user_agent)
         
@@ -338,54 +325,13 @@ def web_request(url, timeout=3, proxies=[], user_agent=None, **kwargs):
         if randint(0, 2) == 0:
             cookies['SOCS'] = 'CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg'
         
-        # Use curl_cffi if available (fixes JA4/JA3 TLS fingerprinting)
-        if CURL_CFFI_AVAILABLE:
-            # Pick random browser to impersonate (mimics real browser TLS fingerprint)
-            browsers = [
-                'chrome131',
-                'chrome130', 
-                'chrome129',
-                'firefox132',
-                'firefox131',
-                'safari17_0',
-                'safari17_2',
-                'edge131',
-                'edge130'
-            ]
-            impersonate = choice(browsers)
-            
-            logging.debug(f"Using curl_cffi with impersonate={impersonate}")
-            
-            # Build proxies dict for curl_cffi
-            proxy_dict = get_proxy(proxies)
-            
-            response = requests.get(
-                url,
-                headers=headers,
-                cookies=cookies,
-                timeout=timeout,
-                proxies=proxy_dict if proxy_dict else None,
-                verify=False,
-                impersonate=impersonate,  # This fixes JA4 fingerprinting!
-                **kwargs
-            )
-        else:
-            # Fallback to regular requests (will likely be blocked by JA4 detection)
-            s = requests.Session()
-            r = requests.Request('GET', url, headers=headers, cookies=cookies, **kwargs)
-            p = r.prepare()
-            response = s.send(p, timeout=timeout, verify=False, proxies=get_proxy(proxies))
-        
-        return response
-        
-    except RequestsError as e:
-        if 'TooManyRedirects' in str(type(e).__name__):
-            Log.fail('Proxy Error: {}'.format(e))
-        else:
-            logging.debug(f'Request error: {e}')
-    except Exception as e:
-        logging.debug(f'Unexpected error: {e}')
-    
+        r = requests.Request('GET', url, headers=headers, cookies=cookies, **kwargs)
+        p = r.prepare()
+        return s.send(p, timeout=timeout, verify=False, proxies=get_proxy(proxies))
+    except requests.exceptions.TooManyRedirects as e:
+        Log.fail('Proxy Error: {}'.format(e))
+    except:
+        pass
     return False
 
 
