@@ -2,10 +2,10 @@ import logging
 import requests
 import threading
 from time import sleep
-from random import choice
+from random import choice, uniform, randint
 from bs4 import BeautifulSoup
 from unidecode import unidecode
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from crosslinked.logger import Log
 from datetime import datetime, timedelta
 from urllib3 import disable_warnings, exceptions
@@ -13,6 +13,80 @@ from urllib3 import disable_warnings, exceptions
 disable_warnings(exceptions.InsecureRequestWarning)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 csv = logging.getLogger('cLinked_csv')
+
+
+def build_google_query(company, start_offset):
+    """
+    Build varied Google search queries to avoid detection patterns.
+    Randomizes query structure while maintaining functionality.
+    """
+    # Different query structures that produce same results
+    query_templates = [
+        # Standard format
+        'site:linkedin.com/in "{company}"',
+        # Reverse order
+        '"{company}" site:linkedin.com/in',
+        # With OR operator (same company twice, but looks different)
+        'site:linkedin.com/in ("{company}" OR "{company}")',
+        # With wildcard (still matches exact)
+        'site:linkedin.com/in "{company}"*',
+        # With intitle (LinkedIn profiles have company in title)
+        'site:linkedin.com/in intitle:"{company}"',
+        # Multiple site variations (all same)
+        '(site:linkedin.com/in OR site:www.linkedin.com/in) "{company}"',
+        # With inurl (redundant but valid)
+        'site:linkedin.com/in inurl:in "{company}"',
+    ]
+    
+    query = choice(query_templates).format(company=company)
+    
+    # Randomize parameter order
+    params = []
+    
+    # Add num parameter with slight variation
+    num_results = choice([100, 99, 98])  # Google treats these similarly
+    params.append(('num', num_results))
+    
+    # Add start parameter
+    params.append(('start', start_offset))
+    
+    # Occasionally add extra parameters that don't affect results
+    if randint(0, 2) == 0:
+        # Add filter parameter (default is 1 anyway)
+        params.append(('filter', 1))
+    
+    if randint(0, 2) == 0:
+        # Add safe search (default is off)
+        params.append(('safe', 'off'))
+    
+    # Randomize parameter order
+    from random import shuffle
+    shuffle(params)
+    
+    # Build URL with randomized parameter order
+    param_str = '&'.join([f'{k}={v}' for k, v in params])
+    url = f'https://www.google.com/search?q={quote_plus(query)}&{param_str}'
+    
+    return url
+
+
+def build_bing_query(company, start_offset):
+    """
+    Build varied Bing search queries to avoid detection patterns.
+    """
+    query_templates = [
+        '"{company}" site:linkedin.com/in',
+        'site:linkedin.com/in "{company}"',
+        '("{company}") site:linkedin.com/in',
+        'site:linkedin.com/in ("{company}")',
+    ]
+    
+    query = choice(query_templates).format(company=company)
+    
+    # Bing uses 'first' parameter for pagination
+    url = f'http://www.bing.com/search?q={quote_plus(query)}&first={start_offset}'
+    
+    return url
 
 
 class Timer(threading.Thread):
@@ -40,6 +114,7 @@ class Timer(threading.Thread):
 class CrossLinked:
     def __init__(self, search_engine, target, timeout, conn_timeout=3, proxies=[], jitter=0):
         self.results = []
+        # Keep old URL templates for compatibility, but will use new builders
         self.url = {'google': 'https://www.google.com/search?q=site:linkedin.com/in+"{}"&num=100&start={}',
                     'bing': 'http://www.bing.com/search?q="{}"+site:linkedin.com/in&first={}'}
 
@@ -50,6 +125,8 @@ class CrossLinked:
         self.proxies = proxies
         self.target = target
         self.jitter = jitter
+        self.user_agent = get_agent()  # Pick one user agent per session
+        self.request_count = 0  # Track requests for behavior variation
 
     def search(self):
         search_timer = Timer(self.timeout)
@@ -57,8 +134,17 @@ class CrossLinked:
 
         while search_timer.running:
             try:
-                url = self.url[self.search_engine].format(self.target, len(self.results))
-                resp = web_request(url, self.conn_timeout, self.proxies)
+                # Build query with randomization
+                if self.search_engine == 'google':
+                    url = build_google_query(self.target, len(self.results))
+                elif self.search_engine == 'bing':
+                    url = build_bing_query(self.target, len(self.results))
+                else:
+                    # Fallback to old method
+                    url = self.url[self.search_engine].format(self.target, len(self.results))
+                
+                # Make request with session-consistent user agent
+                resp = web_request(url, self.conn_timeout, self.proxies, user_agent=self.user_agent)
                 http_code = get_statuscode(resp)
 
                 if http_code != 200:
@@ -69,7 +155,17 @@ class CrossLinked:
                 self.page_parser(resp)
                 Log.info("{:<3} {} ({})".format(len(self.results), url, http_code))
 
-                sleep(self.jitter)
+                # Variable delay that increases slightly with each request (mimics human fatigue)
+                self.request_count += 1
+                base_jitter = self.jitter if self.jitter > 0 else 1
+                # Add random variation ±30% and slight increase over time
+                jitter_variation = uniform(base_jitter * 0.7, base_jitter * 1.3)
+                fatigue_factor = 1 + (self.request_count * 0.02)  # 2% slower each request
+                actual_delay = jitter_variation * fatigue_factor
+                
+                logging.debug(f"Sleeping for {actual_delay:.2f} seconds (request #{self.request_count})")
+                sleep(actual_delay)
+                
             except KeyboardInterrupt:
                 Log.warn("Key event detected, exiting search...")
                 break
@@ -144,22 +240,92 @@ def get_proxy(proxies):
 
 def get_agent():
     return choice([
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:104.0) Gecko/20100101 Firefox/104.0'
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 12.5; rv:104.0) Gecko/20100101 Firefox/104.0',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:132.0) Gecko/20100101 Firefox/132.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0'
     ])
 
 
-def web_request(url, timeout=3, proxies=[], **kwargs):
+def get_varied_headers(user_agent=None):
+    """
+    Generate varied but realistic browser headers.
+    Randomizes some values to avoid fingerprinting.
+    """
+    if user_agent is None:
+        user_agent = get_agent()
+    
+    # Vary Accept-Language slightly
+    accept_languages = [
+        'en-US,en;q=0.9',
+        'en-US,en;q=0.9,es;q=0.8',
+        'en-US,en;q=0.9,fr;q=0.8',
+        'en-GB,en;q=0.9,en-US;q=0.8',
+        'en-US,en;q=0.8',
+    ]
+    
+    # Vary Accept header slightly
+    accept_headers = [
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    ]
+    
+    headers = {
+        'User-Agent': user_agent,
+        'Accept': choice(accept_headers),
+        'Accept-Language': choice(accept_languages),
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+    }
+    
+    # Randomly include/exclude some optional headers
+    if randint(0, 1):
+        headers['DNT'] = '1'
+    
+    if randint(0, 2) == 0:
+        headers['Cache-Control'] = 'max-age=0'
+    
+    # Randomly add viewport width (realistic browser behavior)
+    if randint(0, 3) == 0:
+        widths = [1920, 1680, 1440, 1366, 1280, 1024]
+        headers['Viewport-Width'] = str(choice(widths))
+    
+    return headers
+
+
+def web_request(url, timeout=3, proxies=[], user_agent=None, **kwargs):
     try:
         s = requests.Session()
-        r = requests.Request('GET', url, headers={'User-Agent': get_agent()}, cookies = {'CONSENT' : 'YES'}, **kwargs)
+        
+        # Get varied headers
+        headers = get_varied_headers(user_agent)
+        
+        # Vary cookie slightly
+        consent_variations = [
+            'YES+cb.20210720-07-p0.en+FX+410',
+            'YES+cb.20210720-07-p0.en+FX+411',
+            'YES+cb.20210720-07-p0.en+FX+412',
+            'YES+cb',
+        ]
+        cookies = {'CONSENT': choice(consent_variations)}
+        
+        # Occasionally add SOCS cookie (another Google cookie)
+        if randint(0, 2) == 0:
+            cookies['SOCS'] = 'CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg'
+        
+        r = requests.Request('GET', url, headers=headers, cookies=cookies, **kwargs)
         p = r.prepare()
         return s.send(p, timeout=timeout, verify=False, proxies=get_proxy(proxies))
     except requests.exceptions.TooManyRedirects as e:
